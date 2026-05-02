@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Experiment outputs and downloaded assets
+data/
+datasets/
+outputs/
+runs/
+*.pt
+!yolo11n-seg.pt
+!yolo26n-seg.pt
+*.onnx
+*.engine
+*.torchscript
+*.mlpackage/
+
+# Notebook runtime checkpoints
+.ipynb_checkpoints/
