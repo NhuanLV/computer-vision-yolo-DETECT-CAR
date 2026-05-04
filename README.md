@@ -1,6 +1,8 @@
-# Phân Vùng Xe Cộ Bằng YOLO26n-seg
+# So Sánh Phương Tiện Bằng YOLO26n-seg, YOLO11n-seg Và SSD
 
-Project này triển khai bài: tìm hiểu một phương pháp học sâu cho phân vùng đối tượng, cài đặt và đánh giá trên tập dữ liệu công khai. Hướng chính là **instance segmentation xe cộ** bằng `yolo26n-seg.pt`, có baseline `yolo11n-seg.pt`.
+Project này triển khai bài: tìm hiểu mô hình học sâu cho xử lý ảnh phương tiện, cài đặt và đánh giá trên tập dữ liệu công khai. Hệ thống hiện so sánh **YOLO26n-seg**, **YOLO11n-seg** và **SSD SSDLite MobileNet V3** từ `torchvision`.
+
+Hai mô hình YOLO là instance segmentation nên trả về mask và bounding box. SSD là object detection nên chỉ trả về bounding box, confidence và lớp xe.
 
 Các lớp xe dùng trong COCO:
 
@@ -80,9 +82,15 @@ python vehicle_segmentation.py predict \
 outputs/predict/vehicle_examples/
 ```
 
-## 4. Giao Diện Upload Ảnh
+## 4. Giao Diện So Sánh 3 Mô Hình
 
-Dự án có giao diện web local tại `app.py`. Khi upload ảnh, hệ thống tự chạy YOLO segmentation và hiển thị mask, số lượng xe theo lớp, bảng confidence, box và diện tích mask.
+Dự án có giao diện web local tại `app.py`. Khi upload ảnh, hệ thống tự chạy 3 mô hình:
+
+- `yolo26n-seg.pt`
+- `yolo11n-seg.pt`
+- `ssdlite320_mobilenet_v3_large` từ `torchvision`
+
+Giao diện hiển thị bảng so sánh thời gian chạy, FPS, số xe phát hiện, confidence trung bình/cao nhất, số tham số và số lượng từng lớp xe. YOLO hiển thị mask + box; SSD hiển thị box.
 
 ```bash
 streamlit run app.py
@@ -101,7 +109,7 @@ Kết quả từ giao diện được lưu vào:
 outputs/app/
 ```
 
-## 5. So Sánh YOLO26n-seg Và YOLO11n-seg
+## 5. So Sánh Định Lượng YOLO26n-seg Và YOLO11n-seg
 
 Chạy nhanh trên COCO128-Seg:
 
@@ -117,6 +125,8 @@ Kết quả:
 - `outputs/compare/comparison_summary.csv`
 - `outputs/compare/comparison_per_class.csv`
 - `outputs/compare/comparison_bar.png`
+
+Lệnh CLI này dùng validation segmentation của Ultralytics nên chỉ áp dụng trực tiếp cho các mô hình YOLO `*-seg`. SSD trong `torchvision` được dùng trong giao diện upload ảnh để so sánh detection box-only trên cùng ảnh đầu vào.
 
 ## 6. Đánh Giá Chính Trên COCO Val2017
 
@@ -206,7 +216,9 @@ docs/results_coco_val2017.md
 Trong báo cáo cần làm rõ:
 
 - vì sao chọn YOLO26n-seg;
+- vì sao thêm SSD SSDLite MobileNet V3 làm mô hình object detection so sánh;
 - YOLO segmentation khác detection thường ở đâu;
+- SSD không sinh mask nên không có metric mask hoặc diện tích mask;
 - kết quả định lượng theo mask mAP và tốc độ;
 - ảnh minh họa lỗi: xe nhỏ, che khuất, nhiều xe gần nhau, mask thiếu hoặc lẫn nền.
 
@@ -215,5 +227,6 @@ Trong báo cáo cần làm rõ:
 - Ultralytics YOLO segmentation docs: https://docs.ultralytics.com/tasks/segment/
 - COCO-Seg docs: https://docs.ultralytics.com/datasets/segment/coco/
 - COCO128-Seg docs: https://docs.ultralytics.com/datasets/segment/coco128-seg/
+- Torchvision detection models: https://pytorch.org/vision/stable/models.html
 - Google Colab FAQ: https://research.google.com/colaboratory/faq.html
 - PyTorch MPS docs: https://docs.pytorch.org/docs/stable/notes/mps

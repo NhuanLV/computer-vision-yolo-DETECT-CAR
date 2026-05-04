@@ -26,6 +26,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 
 COCO128_SEG_URL = (
     "https://github.com/ultralytics/assets/releases/download/v0.0.0/"
@@ -122,6 +124,26 @@ COCO_NAMES = [
 
 VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SSD_MODEL_NAME = "ssdlite320_mobilenet_v3_large"
+SSD_MODEL_DISPLAY_NAME = "SSD SSDLite MobileNet V3"
+SSD_TORCHVISION_TO_COCO = {
+    2: 1,  # bicycle
+    3: 2,  # car
+    4: 3,  # motorcycle
+    6: 5,  # bus
+    8: 7,  # truck
+}
+DETECTION_COLUMNS = [
+    "stt",
+    "lop",
+    "confidence",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "box_area_px",
+    "mask_area_px",
+]
 
 
 def parse_class_ids(value: str | None) -> list[int]:
@@ -180,6 +202,17 @@ def import_yolo() -> Any:
         ) from exc
 
 
+def import_torchvision_detection() -> Any:
+    try:
+        from torchvision.models import detection
+
+        return detection
+    except Exception as exc:  # pragma: no cover - depends on user environment
+        raise RuntimeError(
+            "torchvision detection models are unavailable. Run: python -m pip install -r requirements.txt"
+        ) from exc
+
+
 def choose_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -189,6 +222,16 @@ def choose_device(requested: str) -> str:
         return "0"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
+    return "cpu"
+
+
+def torch_device_name(device: str) -> str:
+    torch = import_torch()
+    if device in {"0", "cuda", "cuda:0"}:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device == "mps":
+        has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        return "mps" if has_mps else "cpu"
     return "cpu"
 
 
@@ -320,9 +363,337 @@ def collect_images(source: str, max_images: int | None = None, seed: int = 42) -
 
 def model_parameter_count(model: Any) -> float | None:
     try:
-        return sum(param.numel() for param in model.model.parameters()) / 1_000_000
+        module = getattr(model, "model", model)
+        return sum(param.numel() for param in module.parameters()) / 1_000_000
     except Exception:
         return None
+
+
+def detection_counts(rows: list[dict[str, Any]], class_ids: list[int]) -> dict[str, int]:
+    counts = {class_label(class_id): 0 for class_id in class_ids}
+    for row in rows:
+        label = str(row.get("lop", ""))
+        if label in counts:
+            counts[label] += 1
+    return counts
+
+
+def box_iou(row_a: dict[str, Any], row_b: dict[str, Any]) -> float:
+    x_left = max(float(row_a["x1"]), float(row_b["x1"]))
+    y_top = max(float(row_a["y1"]), float(row_b["y1"]))
+    x_right = min(float(row_a["x2"]), float(row_b["x2"]))
+    y_bottom = min(float(row_a["y2"]), float(row_b["y2"]))
+    intersection = max(0.0, x_right - x_left) * max(0.0, y_bottom - y_top)
+    if intersection <= 0:
+        return 0.0
+
+    area_a = max(0.0, float(row_a["x2"]) - float(row_a["x1"])) * max(
+        0.0, float(row_a["y2"]) - float(row_a["y1"])
+    )
+    area_b = max(0.0, float(row_b["x2"]) - float(row_b["x1"])) * max(
+        0.0, float(row_b["y2"]) - float(row_b["y1"])
+    )
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def class_aware_nms_rows(rows: list[dict[str, Any]], iou_threshold: float) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    kept_rows: list[dict[str, Any]] = []
+    for label in sorted({str(row["lop"]) for row in rows}):
+        candidates = sorted(
+            [row for row in rows if str(row["lop"]) == label],
+            key=lambda row: float(row["confidence"]),
+            reverse=True,
+        )
+        while candidates:
+            best = candidates.pop(0)
+            kept_rows.append(best)
+            candidates = [
+                candidate
+                for candidate in candidates
+                if box_iou(best, candidate) <= iou_threshold
+            ]
+
+    kept_rows.sort(key=lambda row: float(row["confidence"]), reverse=True)
+    for index, row in enumerate(kept_rows, start=1):
+        row["stt"] = index
+    return kept_rows
+
+
+def cross_class_nms_rows(rows: list[dict[str, Any]], iou_threshold: float) -> list[dict[str, Any]]:
+    candidates = sorted(rows, key=lambda row: float(row["confidence"]), reverse=True)
+    kept_rows: list[dict[str, Any]] = []
+    while candidates:
+        best = candidates.pop(0)
+        kept_rows.append(best)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if box_iou(best, candidate) <= iou_threshold
+        ]
+
+    for index, row in enumerate(kept_rows, start=1):
+        row["stt"] = index
+    return kept_rows
+
+
+def comparison_summary_row(
+    model_name: str,
+    output_type: str,
+    rows: list[dict[str, Any]],
+    elapsed_seconds: float,
+    params_m: float | None,
+    device: str,
+    class_ids: list[int],
+    conf_threshold: float | None = None,
+    nms_iou: float | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    confidences = [float(row["confidence"]) for row in rows if row.get("confidence") is not None]
+    summary: dict[str, Any] = {
+        "model": model_name,
+        "output_type": output_type,
+        "detections": len(rows),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "fps": round(1.0 / elapsed_seconds, 2) if elapsed_seconds > 0 else 0.0,
+        "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
+        "max_confidence": round(max(confidences), 3) if confidences else None,
+        "classes_detected": len({row["lop"] for row in rows}),
+        "params_m": round(params_m, 3) if params_m is not None else None,
+        "device": device,
+        "conf_threshold": conf_threshold,
+        "nms_iou": nms_iou,
+        "note": note,
+    }
+    for name, count in detection_counts(rows, class_ids).items():
+        summary[f"count_{name.replace(' ', '_')}"] = count
+    return summary
+
+
+def yolo_detection_rows(result: Any, class_ids: list[int] | None = None) -> list[dict[str, Any]]:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or boxes.cls is None or len(boxes) == 0:
+        return []
+
+    allowed = set(class_ids) if class_ids else None
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    classes = boxes.cls.detach().cpu().numpy().astype(int)
+    confidences = boxes.conf.detach().cpu().numpy()
+
+    mask_areas: list[int | None] = [None] * len(classes)
+    masks = getattr(result, "masks", None)
+    if masks is not None and getattr(masks, "data", None) is not None:
+        mask_data = masks.data.detach().cpu().numpy()
+        for index in range(min(len(mask_areas), len(mask_data))):
+            mask_areas[index] = int(mask_data[index].sum())
+
+    rows: list[dict[str, Any]] = []
+    for index, class_id in enumerate(classes):
+        if allowed is not None and int(class_id) not in allowed:
+            continue
+        x1, y1, x2, y2 = xyxy[index]
+        rows.append(
+            {
+                "stt": len(rows) + 1,
+                "lop": class_label(int(class_id)),
+                "confidence": round(float(confidences[index]), 3),
+                "x1": int(round(float(x1))),
+                "y1": int(round(float(y1))),
+                "x2": int(round(float(x2))),
+                "y2": int(round(float(y2))),
+                "box_area_px": int(max(0, x2 - x1) * max(0, y2 - y1)),
+                "mask_area_px": mask_areas[index],
+            }
+        )
+    return rows
+
+
+def run_yolo_prediction(
+    model: Any,
+    image: Any,
+    model_name: str,
+    class_ids: list[int],
+    device: str,
+    imgsz: int,
+    conf: float,
+    iou: float,
+) -> dict[str, Any]:
+    start = time.perf_counter()
+    results = model.predict(
+        source=np.array(image),
+        classes=class_ids,
+        imgsz=imgsz,
+        conf=conf,
+        iou=iou,
+        device=device,
+        retina_masks=True,
+        verbose=False,
+    )
+    elapsed = time.perf_counter() - start
+    result = results[0]
+    rows = yolo_detection_rows(result, class_ids)
+    params_m = model_parameter_count(model)
+    return {
+        "model": model_name,
+        "output_type": "Mask + Box",
+        "detections": rows,
+        "elapsed_seconds": elapsed,
+        "device": device,
+        "params_m": params_m,
+        "raw_result": result,
+        "summary": comparison_summary_row(
+            model_name=model_name,
+            output_type="Mask + Box",
+            rows=rows,
+            elapsed_seconds=elapsed,
+            params_m=params_m,
+            device=device,
+            class_ids=class_ids,
+            conf_threshold=conf,
+            nms_iou=None,
+        ),
+    }
+
+
+def load_torchvision_ssd() -> Any:
+    detection = import_torchvision_detection()
+    weights = detection.SSDLite320_MobileNet_V3_Large_Weights.DEFAULT
+    model = detection.ssdlite320_mobilenet_v3_large(weights=weights)
+    model.eval()
+    return model
+
+
+def ssd_detection_rows(
+    prediction: dict[str, Any],
+    class_ids: list[int],
+    conf: float,
+    nms_iou: float,
+    bicycle_fix: bool = True,
+) -> list[dict[str, Any]]:
+    allowed = set(class_ids)
+    boxes = prediction.get("boxes")
+    labels = prediction.get("labels")
+    scores = prediction.get("scores")
+    if boxes is None or labels is None or scores is None:
+        return []
+
+    boxes_np = boxes.detach().cpu().numpy()
+    labels_np = labels.detach().cpu().numpy().astype(int)
+    scores_np = scores.detach().cpu().numpy()
+
+    rows: list[dict[str, Any]] = []
+    for index, label in enumerate(labels_np):
+        coco_class = SSD_TORCHVISION_TO_COCO.get(int(label))
+        score = float(scores_np[index])
+        x1, y1, x2, y2 = boxes_np[index]
+        width = max(1.0, float(x2 - x1))
+        height = max(1.0, float(y2 - y1))
+        aspect = height / width
+        if (
+            bicycle_fix
+            and coco_class == 3
+            and 1 in allowed
+            and aspect >= 1.55
+            and score <= 0.35
+        ):
+            coco_class = 1
+
+        class_conf = min(conf, 0.10) if coco_class in {1, 3} else conf
+        if coco_class is None or coco_class not in allowed or score < class_conf:
+            continue
+        rows.append(
+            {
+                "stt": len(rows) + 1,
+                "lop": class_label(coco_class),
+                "confidence": round(score, 3),
+                "x1": int(round(float(x1))),
+                "y1": int(round(float(y1))),
+                "x2": int(round(float(x2))),
+                "y2": int(round(float(y2))),
+                "box_area_px": int(max(0, x2 - x1) * max(0, y2 - y1)),
+                "mask_area_px": None,
+            }
+        )
+    rows = class_aware_nms_rows(rows, nms_iou)
+    return cross_class_nms_rows(rows, nms_iou)
+
+
+def _run_ssd_once(
+    model: Any,
+    image: Any,
+    class_ids: list[int],
+    device: str,
+    conf: float,
+    nms_iou: float,
+    bicycle_fix: bool,
+) -> dict[str, Any]:
+    torch = import_torch()
+    from torchvision.transforms import functional as functional_transforms
+
+    torch_device = torch.device(torch_device_name(device))
+    model.to(torch_device)
+    tensor = functional_transforms.to_tensor(image).to(torch_device)
+
+    start = time.perf_counter()
+    with torch.inference_mode():
+        prediction = model([tensor])[0]
+    elapsed = time.perf_counter() - start
+
+    rows = ssd_detection_rows(
+        prediction,
+        class_ids=class_ids,
+        conf=conf,
+        nms_iou=nms_iou,
+        bicycle_fix=bicycle_fix,
+    )
+    params_m = model_parameter_count(model)
+    actual_device = str(torch_device)
+    return {
+        "model": SSD_MODEL_DISPLAY_NAME,
+        "output_type": "Box",
+        "detections": rows,
+        "elapsed_seconds": elapsed,
+        "device": actual_device,
+        "params_m": params_m,
+        "raw_result": prediction,
+        "summary": comparison_summary_row(
+            model_name=SSD_MODEL_DISPLAY_NAME,
+            output_type="Box",
+            rows=rows,
+            elapsed_seconds=elapsed,
+            params_m=params_m,
+            device=actual_device,
+            class_ids=class_ids,
+            conf_threshold=conf,
+            nms_iou=nms_iou,
+        ),
+    }
+
+
+def run_ssd_prediction(
+    model: Any,
+    image: Any,
+    class_ids: list[int],
+    device: str,
+    conf: float,
+    nms_iou: float = 0.30,
+    bicycle_fix: bool = True,
+) -> dict[str, Any]:
+    requested_device = torch_device_name(device)
+    try:
+        return _run_ssd_once(
+            model, image, class_ids, requested_device, conf, nms_iou, bicycle_fix
+        )
+    except Exception as exc:
+        if requested_device == "cpu":
+            raise
+        result = _run_ssd_once(model, image, class_ids, "cpu", conf, nms_iou, bicycle_fix)
+        note = f"Fallback CPU sau lỗi {requested_device}: {exc}"
+        result["summary"]["note"] = note
+        return result
 
 
 def metrics_summary_row(
@@ -513,6 +884,17 @@ def command_check_env(_: argparse.Namespace) -> None:
         print(f"ultralytics: {ultralytics.__version__}")
     except Exception as exc:
         print(f"ultralytics: unavailable ({exc})")
+
+    try:
+        import torchvision
+
+        detection = import_torchvision_detection()
+        has_ssd = hasattr(detection, "ssdlite320_mobilenet_v3_large")
+        has_weights = hasattr(detection, "SSDLite320_MobileNet_V3_Large_Weights")
+        print(f"torchvision: {torchvision.__version__}")
+        print(f"SSD SSDLite MobileNet V3 available: {has_ssd and has_weights}")
+    except Exception as exc:
+        print(f"torchvision SSD: unavailable ({exc})")
 
 
 def command_prepare_coco128(args: argparse.Namespace) -> None:
